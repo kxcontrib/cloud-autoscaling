@@ -1,0 +1,260 @@
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Amazon EC2 Configuration"
+        Parameters:
+          - AMI
+          - SSHKEY
+          - TICKINSTANCETYPE
+      - Label:
+          default: "Real-time Database Cluster Configuration"
+        Parameters:
+          - RDBINSTANCETYPE
+          - SCALETHRESHOLD
+          - ROLLTHRESHOLD
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - SUBNETID
+          - VPCID
+
+    ParameterLabels:
+      AMI:
+        default: "AMI Id"
+      SSHKEY:
+        default: "SSH Key"
+      TICKINSTANCETYPE:
+        default: "Tickerplant Instance Type"
+      RDBINSTANCETYPE:
+        default: "RDB Instance Type"
+      SCALETHRESHOLD:
+        default: "Scale Threshold"
+      ROLLTHRESHOLD:
+        default: "Roll Threshold"
+      SUBNETID:
+        default: "Subnet Id"
+      VPCID:
+        default: "VPC Id"
+
+Parameters:
+  AMI:
+    Type: AWS::EC2::Image::Id
+    Description: "Choose the AMI to use for the EC2 Instances"
+  SSHKEY:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "Choose the ssh key that will be used to log on to the EC2 instances"
+  TICKINSTANCETYPE:
+    Type: String
+    ConstraintDescription: "Must be a valid EC2 Instance Type"
+    Description: "Choose the Tickerplant's EC2 Instance Type"
+  RDBINSTANCETYPE:
+    Type: String
+    ConstraintDescription: "Must be a valid EC2 Instance Type"
+    Description: "Choose the RDB Cluster's EC2 Instance Type"
+  SCALETHRESHOLD:
+    Type: Number
+    Description: "Choose the Memory Utilisation Percentage to scale up the Cluster"
+    MinValue: 0
+    MaxValue: 100
+  ROLLTHRESHOLD:
+    Type: Number
+    Description: "Choose the Max Memory Utilisation Percentage for each RDB in the Cluster"
+    MinValue: 0
+    MaxValue: 100
+  SUBNETID:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Which Subnet should the EC2 Instances be deployed into"
+  VPCID:
+    Type: AWS::EC2::VPC::Id
+    Description: "Which VPC should the EC2 Instances be deployed into"
+
+Mappings:
+  Constants:
+    UserData:
+      Bootstrap: |
+        #!/bin/bash -x
+        bash -x /opt/rdb-autoscaling/aws/app-userdata.sh
+
+Resources:
+
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: 'IAMRole for the EC2 Instances in the Stack'
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}.iam.policy'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                  - cloudwatch:PutMetricData
+                  - ec2:CreateImage
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientRootAccess
+                  - elasticfilesystem:ClientWrite
+                Resource: "*"
+      RoleName: !Sub '${AWS::StackName}.iam.role'
+
+  IAMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref IAMRole
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security Group to allow EFS to be mounted by EC2 Instances'
+      GroupName: !Sub '${AWS::Region}.${AWS::StackName}.efs-sg'
+      SecurityGroupIngress:
+        - FromPort: 2049
+          IpProtocol: tcp
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      VpcId: !Ref VPCID
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security Group to allow SSH and TCP access for EC2 servers'
+      GroupName: !Sub '${AWS::Region}.${AWS::StackName}.ec2-sg'
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 22
+          IpProtocol: tcp
+          ToPort: 22
+      VpcId: !Ref VPCID
+
+  EC2SecurityGroupTcpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: EC2SecurityGroup
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      FromPort: 5010
+      IpProtocol: tcp
+      ToPort: 5020
+      SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: False
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${AWS::Region}-${AWS::StackName}-efs'
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+  EfsMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+      SubnetId: !Ref SUBNETID
+
+  EC2LaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+            - DeviceName: /dev/xvda
+              Ebs:
+                VolumeSize: 8
+        IamInstanceProfile:
+          Arn: !GetAtt IAMInstanceProfile.Arn
+        ImageId: !Ref AMI
+        KeyName: !Ref SSHKEY
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        UserData:
+          Fn::Base64:
+            !FindInMap [ Constants, UserData, Bootstrap ]
+      LaunchTemplateName: !Sub '${AWS::Region}.ec2-launch-template.${AWS::StackName}'
+
+  TickASG:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::Region}.ec2-asg.${AWS::StackName}-tick-asg'
+      Cooldown: 300
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 60
+      HealthCheckType: EC2
+      MaxSize: 1
+      MinSize: 0
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref EC2LaunchTemplate
+            Version: 1
+          Overrides:
+            - InstanceType: !Ref TICKINSTANCETYPE
+      Tags:
+        - Key: APP
+          PropagateAtLaunch: True
+          Value: tick-asg
+        - Key: EFS
+          PropagateAtLaunch: True
+          Value: !GetAtt EfsMountTarget.IpAddress
+        - Key: Name
+          PropagateAtLaunch: True
+          Value: !Sub '${AWS::Region}.ec2-instance.${AWS::StackName}-tick-asg'
+      VPCZoneIdentifier:
+        - !Ref SUBNETID
+
+  RdbASG:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    DependsOn: [ TickASG ]
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::Region}.ec2-asg.${AWS::StackName}-r-asg'
+      Cooldown: 300
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 60
+      HealthCheckType: EC2
+      MaxSize: 50
+      MinSize: 0
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref EC2LaunchTemplate
+            Version: 1
+          Overrides:
+            - InstanceType: !Ref RDBINSTANCETYPE
+      Tags:
+        - Key: APP
+          PropagateAtLaunch: True
+          Value: r-asg
+        - Key: EFS
+          PropagateAtLaunch: True
+          Value: !GetAtt EfsMountTarget.IpAddress
+        - Key: Name
+          PropagateAtLaunch: True
+          Value: !Sub '${AWS::Region}.ec2-instance.${AWS::StackName}-r-asg'
+        - Key: SCALETHRESHOLD
+          PropagateAtLaunch: True
+          Value: !Ref SCALETHRESHOLD
+        - Key: ROLLTHRESHOLD
+          PropagateAtLaunch: True
+          Value: !Ref ROLLTHRESHOLD
+      VPCZoneIdentifier:
+        - !Ref SUBNETID
